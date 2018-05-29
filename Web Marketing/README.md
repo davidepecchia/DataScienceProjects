@@ -1,4 +1,3 @@
-# Social & Serie A TIM
-This is the final project for the Data Management exam.
-The goal is the create a DB using data about the 'Serie A TIM', the main football championship in Italy, and tweets captured in streaming using Azure virtual machine and Kafka during a classic weekend of football.
-More details and the step y step procedure are available in the PDF report.
+# Tinaba: app analysis & possible improvements
+This is the final project for the Web Marketing exam.
+We performed an analysis of the Tinaba mobile application, explaining the main characteristics and finding possible improvements to make in order to increase the popularity of the app.
