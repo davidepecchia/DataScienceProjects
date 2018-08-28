@@ -6,8 +6,7 @@ Repository containing all the projects made during my Master's Degree in Data Sc
 * Data Visualization
 * Machine Learning
 * Web Marketing
+* Decision Models
+* Data Science Lab
 
 ##### Coming soon:
-* Decision Models
-* Data Semantics
-* Data Science Lab
