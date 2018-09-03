@@ -1,0 +1,579 @@
+---
+title: "Pirelli: Sales Forecasting "
+author: 'Silvia Bordogna, Stefano Daraio, Davide Pecchia '
+date: "11/07/2018"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+### Libraries
+```{r libraries, message=F}
+library("dplyr")
+library("rpart")
+library("rpart.plot")
+library("randomForest")
+library("stepPlr")
+library("pander")
+library("caTools")
+library("glmnet")
+library("KODAMA")
+library("e1071")
+library("knitr")
+library("caret", warn.conflicts = FALSE)
+```
+
+### Dataset
+```{r dataset}
+df <- read.csv("sales_dataset.csv", stringsAsFactors=FALSE)
+```
+
+### Data Exploration
+```{r check_anni_per_product_ID}
+#n product
+n_product = length(unique(df$PRODUCT_ID))
+pander(summary(df$SALES))
+boxplot(df$SALES)
+hist(df$SALES, breaks = 50, main ="Distribuzione Variabile Sales")
+quantile(df$SALES, probs = c(0.3, 0.5, 0.6,0.7,0.8,0.9,0.99))
+
+temp = df %>% group_by (PRODUCT_ID) %>% summarise(MEAN_SALES = mean(SALES),
+                                                  MIN_SALES = min(SALES),
+                                                  MAX_SALES = max(SALES))
+quantile(temp$MEAN_SALES, probs = c(0.3, 0.5, 0.6,0.7,0.8,0.9,0.99))
+```
+```{r}
+
+#check anni per product id
+temp = df %>% group_by(PRODUCT_ID) %>% summarise(dati_storici=n())
+pander(table(temp$dati_storici))
+```
+```{r}
+
+#check product con categorie miste
+temp = unique(df %>% select (PRODUCT_ID, CATEGORICAL_0:CATEGORICAL_8))
+
+#si rimuovono momentaneamente i 3 prodotti che hanno categoria incerta (p_ID 640, 311, 508)
+df=df[!df$PRODUCT_ID %in% c(311,640,508),]
+table(temp$PRODUCT_ID)[table(temp$PRODUCT_ID)!=1]
+```
+
+```{r}
+
+#check time series (full o anni mancanti) 
+temp = df %>% arrange(PRODUCT_ID, YEAR) %>% group_by (PRODUCT_ID) %>% 
+  summarise(
+    #creazione della variabile sales shiftata per costruire confronti facili vs previous year
+    START = min (YEAR),
+    END = max (YEAR),
+    N = n())
+temp$check = (temp$END - temp$START + 1) == temp$N
+sum(!temp$check)
+
+#check numero di categoria per ciascuna var categorica
+for (i in df %>% select(CATEGORICAL_0:CATEGORICAL_8)){
+  print(c(min=min(i), 
+          max=max(i), 
+          n=length(unique(i)), 
+          check=(max(i)-min(i)+1)==length(unique(i))))
+}
+
+```
+
+
+
+```{r}
+#clustering per prodotto
+cols=c(  
+  "CATEGORICAL_0",
+  "CATEGORICAL_1",
+  "CATEGORICAL_2",
+  "CATEGORICAL_3",
+  "CATEGORICAL_4",
+  "CATEGORICAL_5" ,
+  "CATEGORICAL_6" ,
+  "CATEGORICAL_7",
+  "CATEGORICAL_8")
+
+
+ks <- 2:20 # number of clusters we want to try
+ssw <- numeric(length(ks)) # vector for the ss_within
+for (i in seq_along(ks)) {
+set.seed(135)
+ssw[i] <- kmeans(df[,cols], ks[i])$tot.withinss
+}
+plot(x = ks, y = ssw, type = "l",
+xlab = "Number of clusters",
+ylab = "SS_within",
+main = "Look for an elbow")
+
+
+
+cl1= kmeans(df[,cols], 4)
+
+pc1 <- princomp(df[,cols], cor = TRUE)
+df_full <- cbind(df[,cols],
+cluster = as.factor(cl1$cluster),
+pc1 = pc1$scores[, 1],
+pc2 = pc1$scores[, 2])
+library(ggplot2)
+ggplot(df_full, aes(x = pc1, y = pc2, color = cluster)) +
+geom_point()
+df$cluster = cl1$cluster
+
+```
+
+### Pre-processing
+Creazione dataset con serie complete di 9 anni:
+- se ci sono dei valori mancanti vengono sostituiti con 0
+- se mancano degli anni prima o dopo vengono ritenute 0 le vendite di quel prodotto per quel determinato anno
+```{r}
+#se ci sono buchi si riempiono con 0
+#se mancano anni prima e dopo si riempiono con 0
+complete = data.frame(
+  YEAR = rep(seq(1:9), length(unique(df$PRODUCT_ID)) ), #9 year
+  PRODUCT_ID = rep(unique(df$PRODUCT_ID), 9))
+
+temp = unique(df %>% select (PRODUCT_ID, CATEGORICAL_0:CATEGORICAL_8, cluster))
+
+complete2 = merge(complete, temp, all.x = T)
+#complete2=complete2[!complete2$PRODUCT_ID %in% c(311,640,508),]#inutile
+
+df_full = merge(complete2, df, all.x = T)
+df_full[is.na(df_full)] <- 0
+
+```
+
+##### Feature Creation
+```{r}
+
+#creo colonna unica con somma sales di tutti i brand
+df_full$SALES_BRAND = rowSums(df_full %>% select(BRAND_0:BRAND_41))
+
+
+df_2 = df_full %>% arrange(PRODUCT_ID, YEAR) %>% group_by (PRODUCT_ID) %>% 
+  mutate(
+    
+    #creo variabile con somma sales per costruire altre variabili 
+    SALES_SUM = sum(SALES),
+    SALES_BRAND_SUM = sum(SALES_BRAND)
+  
+  ) 
+
+df_final=data.frame(df_2)
+df_final = df_final %>% select (-(BRAND_0 : BRAND_41))
+```
+
+### Data Manipulation
+```{r}
+
+#create observation 0 for missing year
+#move year to column and create a column per each combination of var*year
+#absolute: 1 = anno 1 (es. 2000)
+df_long_abs<-reshape(df_final %>% filter(YEAR %in% c(6,7,8,9)) , timevar="YEAR", 
+                     idvar=c("PRODUCT_ID", 
+                             "CATEGORICAL_0",
+                             "CATEGORICAL_1", 
+                             "CATEGORICAL_2",
+                             "CATEGORICAL_3",
+                             "CATEGORICAL_4",
+                             "CATEGORICAL_5", 
+                             "CATEGORICAL_6",
+                             "CATEGORICAL_7",
+                             "CATEGORICAL_8", 
+                             "cluster"),
+                     direction="wide", sep = "_" ,
+                     drop = c("MAX_YEAR",
+                              "SALES_SUM","SALES_BRAND_SUM",
+                              paste("BRAND_", 0:41, sep="")
+                     ))
+dataset = df_long_abs
+
+```
+
+
+```{r}
+
+#clustering per prodotti in base alle vendite 
+cols=c(
+  "PRODUCT_ID",
+  "SALES_6" ,     
+  "SALES_BRAND_6", 
+  "SALES_7",
+  "SALES_BRAND_7", 
+  "SALES_8",
+  "SALES_BRAND_8"  )
+
+
+ks <- 2:20 # number of clusters we want to try
+ssw <- numeric(length(ks)) # vector for the ss_within
+for (i in seq_along(ks)) {
+set.seed(135)
+ssw[i] <- kmeans(dataset[,cols], ks[i])$tot.withinss
+}
+plot(x = ks, y = ssw, type = "l",
+xlab = "Number of clusters",
+ylab = "SS_within",
+main = "Look for an elbow")
+
+
+
+cl2= kmeans(dataset[,cols], 5)
+
+pc1 <- princomp(dataset[,cols], cor = TRUE)
+df_full <- cbind(dataset[,cols],
+cluster = as.factor(cl2$cluster),
+pc1 = pc1$scores[, 1],
+pc2 = pc1$scores[, 2])
+library(ggplot2)
+ggplot(df_full, aes(x = pc1, y = pc2, color = cluster)) +
+geom_point()
+dataset$cluster_2 = cl2$cluster
+
+ggplot(dataset, aes(SALES_6))+geom_histogram()+facet_grid(. ~ as.factor(cluster_2 ))
+
+```
+
+### Data Preparation
+```{r}
+
+dataset$SHARE_SALES_9= NULL
+dataset$SALES_BRAND_9= NULL
+
+
+#divisione train e test set
+sample = sample.split(dataset$PRODUCT_ID, SplitRatio = .70)
+train=dataset[-sample,]
+test=dataset[sample,]
+
+train$PRODUCT_ID=NULL
+test$PRODCUT_ID=NULL
+```
+
+
+
+##### Rpart Tree
+Analisi delle varibili rilevanti e definisizione dei metodi di controllo
+```{r}
+
+set.seed(123)
+
+Ctrl <- trainControl(method = "cv" , number=10)
+
+rpartTree <- train((SALES_9) ~ ., data = train, method = "rpart",
+                   tuneLength = 15, trControl = Ctrl)
+
+pander(getTrainPerf(rpartTree))
+rpartTree
+```
+
+
+```{r}
+Vimportance <- varImp(rpartTree)
+plot(Vimportance)
+```
+
+
+```{r}
+
+set.seed(123)
+
+Ctrl2 <- trainControl(method = "cv" , number=10,  savePredictions = TRUE)
+
+rpartTreeTuned <- train(SALES_9 ~ ., data = train, method = "rpart",
+                     tuneGrid=data.frame(cp=0.0003942883),
+                     trControl = Ctrl2)
+pander(getTrainPerf(rpartTreeTuned))
+rpartTreeTuned
+
+```
+
+
+### Model Training 
+##### Regressione lineare
+-
+```{r}
+
+set.seed(123)
+
+Ctrl <- trainControl(method = "cv" , number=10)
+
+lmTuned <- train(SALES_9 ~ ., data = train, method = "lm",
+                tuneLength = 15, trControl = Ctrl)
+
+pander(getTrainPerf(lmTuned))
+lmTuned
+```
+
+##### SVM
+- standard
+```{r}
+set.seed(123)
+rmse <- function(error) { sqrt(mean(error^2)) }
+SVM <- train(SALES_9~., data=train,
+                   method = "svmRadial",   # Radial kernel
+                   preProc = c("center","scale"),  # Center and scale data
+                   trControl=Ctrl)
+
+pander(getTrainPerf(SVM))
+SVM
+```
+-polynomial
+```{r}
+set.seed(123)
+tuneResult_polynomial <- tune.svm(SALES_9 ~ ., data = train, kernel = "polynomial", 
+                                  epsilon = seq(0.5,6,0.5), cost = 2^(1:8))
+
+print(tuneResult_polynomial)
+plot(tuneResult_polynomial)
+tunedModel_polynomial <- tuneResult_polynomial$best.model
+
+
+tunedModelY <- predict(tunedModel_polynomial, test) 
+error <- test$SALES_9 - tunedModelY  
+tunedModelRMSE <- rmse(error)
+tunedModelRMSE
+```
+-radial 
+```{r}
+set.seed(123)
+tuneResult_radial <- tune.svm(SALES_9 ~ ., data = train, kernel = "radial", 
+                              epsilon = seq(0,6,0.5), cost = 2^(1:8))
+
+print(tuneResult_radial)
+plot(tuneResult_radial)
+tunedModel_radial <- tuneResult_radial$best.model
+
+
+tunedModelY <- predict(tunedModel_radial, test) 
+error <- test$SALES_9 - tunedModelY  
+tunedModelRMSE <- rmse(error)
+tunedModelRMSE
+
+```
+-best SVM
+```{r}
+tunedSVM <- svm(SALES_9 ~ ., train, kernel = "radial", epsilon = 0, cost = 4)
+tunedModelY <- predict(tunedSVM, test) 
+error <- test$SALES_9 - tunedModelY  
+tunedModelRMSE <- rmse(error)
+tunedModelRMSE
+```
+
+
+##### Lasso
+-con preprocessing
+```{r}
+
+set.seed(123)
+glmnet_grid <- expand.grid(alpha = 1, lambda = seq(0.5, 100, length = 20))
+model_lasso_standard <- train(SALES_9~., data=train, method="glmnet", 
+                              tuneGrid=glmnet_grid, preProc = c("center", "scale"),  
+                              trControl=Ctrl)
+plot(model_lasso_standard)
+pander(getTrainPerf(model_lasso_standard))
+model_lasso_standard
+
+model_lasso_standard$bestTune
+coef(model_lasso_standard$finalModel, s=model_lasso_standard$bestTune$lambda)
+```
+
+
+##### Ridge standard
+
+```{r}
+
+glmnet_grid <- expand.grid(alpha = c(0), lambda = seq(0.5, 100, length = 20))
+model_ridge_standard <- train(SALES_9~., data=train, method="glmnet", 
+                              tuneGrid=glmnet_grid,  trControl=Ctrl)
+plot(model_ridge_standard)
+pander(getTrainPerf(model_ridge_standard))
+model_ridge_standard
+
+model_ridge_standard$bestTune
+coef(model_ridge_standard$finalModel, s=model_ridge_standard$bestTune$lambda)
+```
+
+##### Random Forest
+-standard
+```{r}
+set.seed(123)
+tunegrid <- expand.grid(mtry=c(2:12))
+RandomForestClassic <- train(SALES_9 ~ ., data = train, method = 'rf',
+                       tuneGrid=tunegrid, trControl = Ctrl)
+pander(getTrainPerf(RandomForestClassic))
+RandomForestClassic
+```
+-ranger
+```{r}
+set.seed(123)
+tunegrid <- expand.grid(mtry=c(2:12), splitrule='variance' , min.node.size= c(1,10,50))
+RandomForestRanger <- train(SALES_9 ~ ., data = train, method = 'ranger',
+                       tuneGrid=tunegrid, trControl = Ctrl)
+pander(getTrainPerf(RandomForestRanger))
+RandomForestRanger
+```
+
+
+
+#####KNN
+
+```{r}
+
+set.seed(123)
+KNN <- train( SALES_9 ~ ., train, method = "knn", tuneLength = 30, 
+              preProcess = c("center", "scale"), trControl = Ctrl)
+plot(KNN)
+pander(getTrainPerf(KNN))
+KNN
+```
+
+
+
+```{r}
+
+set.seed(123)
+tunegrid <- expand.grid(k=31)
+KNN2 <- train( SALES_9 ~ ., train, method = "knn", tuneGrid=tunegrid, 
+               preProcess = c("center", "scale"), trControl = Ctrl)
+pander(getTrainPerf(KNN2))
+KNN2
+```
+
+
+```{r}
+
+set.seed(123)
+KNN3 <- train( SALES_9 ~ ., train, method = "knn", tuneLength = 30, 
+               preProcess = c("center", "scale"), 
+               trControl = trainControl(method = "boot"))
+plot(KNN3)
+pander(getTrainPerf(KNN3))
+KNN3
+```
+
+##### Neural Network
+-pre processing PCA
+```{r}
+set.seed(123)
+tunegrid <- expand.grid(size=c(1:5), decay = c(0.00001, 0.0001, 0.0002, 0.0003))
+NN1 <- train(train %>% select (-SALES_9) ,train$SALES_9,
+                            method = "nnet",
+                            preProcess = 'pca',
+                            trControl=Ctrl, tuneGrid=tunegrid,
+                            trace = FALSE,
+                            maxit = 100)
+
+pander(getTrainPerf(NN1))
+pander(NN1$bestTune)
+```
+
+-pre processing range
+```{r}
+set.seed(123)
+tunegrid <- expand.grid(size=c(1:5), decay = c(0.00001, 0.0001, 0.0002, 0.0003))
+NN2 <- train(train[-1], train$SALES_9,
+                            method = "nnet",
+                            preProcess = c('range'),
+                            trControl=Ctrl, tuneGrid=tunegrid,
+                            trace = FALSE,
+                            maxit = 100)
+pander(getTrainPerf(NN2))
+pander(NN2$bestTune)
+```
+
+-pre processing center, scale
+```{r}
+set.seed(123)
+tunegrid <- expand.grid(size=c(1:5), decay = c(0.00001, 0.0001, 0.0002, 0.0003))
+NN3 <- train(train[-1], train$SALES_9,
+                            method = "nnet",
+                            preProcess = c('center', "scale"),
+                            trControl=Ctrl, tuneGrid=tunegrid,
+                            trace = FALSE,
+                            maxit = 100)
+pander(getTrainPerf(NN3))
+pander(NN3$bestTune)
+
+```
+
+
+
+```{r}
+rbind(getTrainPerf(rpartTreeTuned), getTrainPerf(lmTuned), 
+      getTrainPerf(model_lasso_standard), 
+      getTrainPerf(model_ridge_standard), 
+      getTrainPerf(RandomForestClassic), 
+      getTrainPerf(RandomForestRanger), 
+      getTrainPerf(KNN), getTrainPerf(KNN2), 
+      getTrainPerf(KNN3), getTrainPerf(NN1), 
+      getTrainPerf(NN2), getTrainPerf(NN3))
+```
+
+###Results
+##### Plot
+```{r}
+#MAE
+res=rbind(getTrainPerf(rpartTreeTuned), getTrainPerf(lmTuned), 
+          getTrainPerf(SVM), getTrainPerf(model_lasso_standard), 
+          getTrainPerf(model_ridge_standard), 
+          getTrainPerf(RandomForestClassic), 
+          getTrainPerf(RandomForestRanger), getTrainPerf(KNN), 
+          getTrainPerf(KNN2), getTrainPerf(KNN3), getTrainPerf(NN1), 
+          getTrainPerf(NN2), getTrainPerf(NN3))
+ggplot(res, aes(x=method, y=TrainMAE)) +
+ geom_segment( aes(x=method, xend=method, y=0, yend=TrainMAE)) +
+ geom_point( size=3, color="red", fill=alpha("yellow", 0.3), alpha=0.7, shape=21, stroke=2)+
+ ggtitle("MAE")+
+ theme_light() +
+ theme(
+   plot.title = element_text(color="black", size=15, face="bold", hjust=0.5  ),
+   panel.grid.major.x = element_blank(),
+   panel.border = element_blank(),
+   axis.ticks.x = element_blank()
+ ) +
+ xlab("Modello") +
+ ylab("MAE")
+
+#RMSE
+ggplot(res, aes(x=method, y=TrainRMSE)) +
+ geom_segment( aes(x=method, xend=method, y=0, yend=TrainRMSE)) +
+ geom_point( size=3, color="red", fill=alpha("yellow", 0.3), alpha=0.7, shape=21, stroke=2)+
+ ggtitle("RMSE")+
+ theme_light() +
+ theme(
+   plot.title = element_text(color="black", size=15, face="bold", hjust=0.5  ),
+   panel.grid.major.x = element_blank(),
+   panel.border = element_blank(),
+   axis.ticks.x = element_blank()
+ ) +
+ xlab("Modello") +
+ ylab("RMSE")
+
+```
+
+###### Best models test
+```{r}
+
+ranger_test   <- predict(RandomForestRanger, test)
+rf_test <- predict(RandomForestClassic, test)
+SVM_test <- predict(tunedModel_radial, test)
+
+
+#test Random Forest Ranger
+best_models <- data.frame(rbind(c(RMSE(test$SALES_9, SVM_test), MAE(test$SALES_9, SVM_test)), 
+                                  c(RMSE(test$SALES_9, ranger_test), MAE(test$SALES_9, ranger_test)),
+                                  c(RMSE(test$SALES_9, rf_test), MAE(test$SALES_9, rf_test))
+                        ))
+names(best_models) = c('RMSE', 'MAE')
+rownames(best_models) = c('SVM', 'Ranger', 'Random Forest')
+pander(best_models)
+
+```
+
+
